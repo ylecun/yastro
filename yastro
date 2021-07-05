@@ -1,0 +1,1416 @@
+#!/usr/bin/env python
+
+# astrophotography processing, visualization, and manipulation.
+# Yann LeCun 2021-06-20
+
+# preprocessing and Napari visualization of FITS images.
+# examples:
+# visualizing images
+#   yastro -d -r 3600,2600,2800,2000 -n -g 0.5 -G 2.0 m16*.fit
+# preprocessing and saving images into tmp subdirectory
+#   yastro -r 3600,2600,2800,2000 -n -g 0.5 -c 3.0 -o tmp m16*.fit
+# processing, aligning and stacking
+#   cd /home/yann/Pictures/astro/raw/20210521-m16-e07-6200mm
+#   yastro -n -g 1.0 -G 2.0 -l -D Light_M16_300.0s_Bin1_L*.fit
+#   yastro -v -r 3200,2300,3400,2300 -c 3.0 -n -g 1.0 -G 2.0 -s -a Light_M16_300.0s_Bin1_L_gain100_20210521-012532_0003.fit -t m16-stacked-L.fit -d -f valids-L.txt 
+
+import argparse, os, textwrap
+from astropy.io import fits
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+# other dependencies that are imported by some options:
+# napari: fast/interactive image display
+# scipy.ndimage
+# astroalign: image alignment. https://astroalign.readthedocs.io/en/latest/
+# sep: background separation. Automatically installed with astroalign.
+
+
+"""
+A command-line tool written in Python to display and process images for astrophotography
+Yann LeCun 2021-06-21
+
+Dependencies: Python3, torch, numpy, scipy, astropy, napari, argparse, os.
+Dependencies required by some functions: astroalign, sep.
+
+"""
+
+################################################################
+# Global configuration variables
+
+# default text editor.
+# to override the default, set the $EDITOR shell environment variable.
+# gedit is the default on Linux.
+# Change for Mac and other platforms.
+default_editor = 'gedit'
+
+# parameters for star finder.
+findstars_thres=5   # should probably be made into a command-line option
+findstars_min_area=5
+findstars_max_area=500
+findstars_max_count=200
+
+
+################################################################
+# input/output
+
+# read a FITS image file and return a PyTorch tensor with it.
+# This works for monochrome or color images, and for
+# various pixel formats (byte, int16, float32...)
+# Some byte-swapping is performed if necessary
+# because FITS uses little-endian format and
+# Intel processors use big-endian format.
+def readfits(f,verbose=False) :
+    hl = fits.open(f, ignore_missing_end=True)
+    if verbose == True : hl.info()
+    header = hl[0].header
+    data = hl[0].data
+    bitpix = hl[0].header['bitpix']
+    if bitpix == -32 :
+        if verbose == True :
+            print("readfits: float image, data type:", data.dtype)
+        if data.dtype == np.dtype('>f4') :
+            if verbose == True : print("readfits: im is big endian")
+            im = data.byteswap()
+            im.dtype = np.dtype('<f4')
+        else :
+            im = data
+    else :
+        if verbose == True : print("readfits: not float image")
+        im = data.astype('float32')
+    return torch.from_numpy(im)
+
+# write a FITS images.
+# issues:
+#   Gimp mistakenly reads FITS images saved with this upside down.
+#   So, if the image is to be postprocessed in Gimp, use flip=True
+#   or remember to flip the image manually in Gimp.
+def writefits(x,f,overwrite=True,flip=False,swap=False) :
+    if len(x.size()) > 2 :
+        if flip == True :
+            im = np.flipud(x.movedim(2,0).numpy())
+        else :
+            im = x.movedim(2,0).numpy()
+    else :
+        if flip == True :        
+            im = np.flipud(x.numpy())
+        else :
+            im = x.numpy()
+    if swap == True :
+        im = im.byteswap()
+        
+    hdu = fits.PrimaryHDU(im)
+    hdu.writeto(f,overwrite=overwrite)
+
+################################################################
+
+# compute histogram statistics of a monochrome image (2D torch tensor)
+# returns a list with the following:
+# 0: median,
+# 1: standard deviation of values above median (good for normalization)
+# 2: standard deviation of values below median
+# 3: minimum value
+# 4: maximum value
+def histostatmono(x) :    
+    xmed = torch.median(x)
+    xp = torch.relu(x-xmed).square()
+    np = torch.sign(xp).sum()  # count number of non zero positive values
+    xsp = torch.zeros([])
+    if np > 0 : xsp = torch.sqrt(xp.sum()/np)
+    xm = torch.relu(xmed-x).square()
+    nm = torch.sign(xm).sum()  # count number of non zero negative values
+    xsm = torch.zeros([])
+    if nm > 0 : xsm = torch.sqrt(xm.sum()/nm)
+    xmin = torch.min(x)
+    xmax = torch.max(x)
+    return xmed.item(), xsp.item(), xsm.item(), xmin.item(), xmax.item()
+
+################################################################
+# image processing functions
+
+# ================================================================
+# return a cropped image as a Pytorch tensor.
+# x,y: cropped region's upper-left corner
+# w,h: cropped region's width and height.
+# sizes are clipped to the size of the input image
+# so the size of the returned image may be smaller
+# than w,h.
+def crop(image,x,y,w,h) :
+    sx = image.size(1)
+    if x<0 : x=0
+    if w<0 : x=0
+    if x>sx : x = sx
+    if w>sx : w = sx       
+    if x+w > sx : x = sx-w
+    if x<0 : x=0; w = sx
+    sy = image.size(0)
+    if y<0 : y=0
+    if h<0 : y=0
+    if y>sy : y = sy
+    if h>sy : h = sy              
+    if y+h > sy : y = sy-h
+    if y<0 : y=0; h = sy
+    return image.narrow(0,y,h).narrow(1,x,w)
+
+# ================================================================
+# remove hot and dead pixels.
+# the tolerance parameter is a threshold: if a pixel value is
+# above or below the local average by more than tolerance*stdev,
+# it is set to the local average.
+# Shamelessly lifted from:
+# https://stackoverflow.com/questions/18951500/automatically-remove-hot-dead-pixels-from-an-image-in-python
+def find_outlier_pixels(data,tolerance=3,worry_about_edges=True):
+    # This function finds the hot or dead pixels in a 2D dataset. 
+    # tolerance is the number of standard deviations used to cutoff the hot pixels
+    # If you want to ignore the edges and greatly speed up the code, then set
+    # worry_about_edges to False.
+    # operates on numpy ndarray and returns a numpy ndarray
+    #
+    # The function returns a list of hot pixels and also an image with hot pixels removed
+
+    from scipy.ndimage import median_filter
+    blurred = median_filter(data, size=3)
+    difference = data - blurred
+    threshold = tolerance*np.std(difference)
+    # print("***** outlier threshold = ",threshold)
+    # find the hot pixels, but ignore the edges
+    hot_pixels = np.nonzero((np.abs(difference[1:-1,1:-1])>threshold) )
+    hot_pixels = np.array(hot_pixels) + 1 #because we ignored the first row and first column
+
+    fixed_image = np.copy(data) #This is the image with the hot pixels removed
+    for y,x in zip(hot_pixels[0],hot_pixels[1]):
+        fixed_image[y,x]=0.25*(data[y-1,x]+data[y+1,x]+data[y,x-1]+data[y,x+1])
+        # fixed_image[y,x]=blurred[y,x]
+
+    if worry_about_edges == True:
+        height,width = np.shape(data)
+
+        ###Now get the pixels on the edges (but not the corners)###
+
+        #left and right sides
+        for index in range(1,height-1):
+            #left side:
+            med  = np.median(data[index-1:index+2,0:2])
+            diff = np.abs(data[index,0] - med)
+            if diff>threshold: 
+                hot_pixels = np.hstack(( hot_pixels, [[index],[0]]  ))
+                fixed_image[index,0] = med
+
+            #right side:
+            med  = np.median(data[index-1:index+2,-2:])
+            diff = np.abs(data[index,-1] - med)
+            if diff>threshold: 
+                hot_pixels = np.hstack(( hot_pixels, [[index],[width-1]]  ))
+                fixed_image[index,-1] = med
+
+        #Then the top and bottom
+        for index in range(1,width-1):
+            #bottom:
+            med  = np.median(data[0:2,index-1:index+2])
+            diff = np.abs(data[0,index] - med)
+            if diff>threshold: 
+                hot_pixels = np.hstack(( hot_pixels, [[0],[index]]  ))
+                fixed_image[0,index] = med
+
+            #top:
+            med  = np.median(data[-2:,index-1:index+2])
+            diff = np.abs(data[-1,index] - med)
+            if diff>threshold: 
+                hot_pixels = np.hstack(( hot_pixels, [[height-1],[index]]  ))
+                fixed_image[-1,index] = med
+
+        ###Then the corners###
+
+        #bottom left
+        med  = np.median(data[0:2,0:2])
+        diff = np.abs(data[0,0] - med)
+        if diff>threshold: 
+            hot_pixels = np.hstack(( hot_pixels, [[0],[0]]  ))
+            fixed_image[0,0] = med
+
+        #bottom right
+        med  = np.median(data[0:2,-2:])
+        diff = np.abs(data[0,-1] - med)
+        if diff>threshold: 
+            hot_pixels = np.hstack(( hot_pixels, [[0],[width-1]]  ))
+            fixed_image[0,-1] = med
+
+        #top left
+        med  = np.median(data[-2:,0:2])
+        diff = np.abs(data[-1,0] - med)
+        if diff>threshold: 
+            hot_pixels = np.hstack(( hot_pixels, [[height-1],[0]]  ))
+            fixed_image[-1,0] = med
+
+        #top right
+        med  = np.median(data[-2:,-2:])
+        diff = np.abs(data[-1,-1] - med)
+        if diff>threshold: 
+            hot_pixels = np.hstack(( hot_pixels, [[height-1],[width-1]]  ))
+            fixed_image[-1,-1] = med
+
+    return hot_pixels,fixed_image
+
+
+# ================================================================
+# remove hot pixels from a monochromatic image
+# pixels above or below local mean by stddev*s are smoothed out.
+# typical value for s = 3.0
+def cosmetic(image,s) :
+    hots = []
+    x = image.numpy()
+    hot,r = find_outlier_pixels(x,tolerance=s,worry_about_edges=True)
+    hots.append(hot)
+    return torch.from_numpy(r), hots
+
+# ================================================================
+# binning / subsampling by pixel simple averaging.
+# if s is a positive integer, it is interpreted as a subsampling ratio.
+# if s is a negative integer, minus s is used as the maximum size of the output image.
+def binning(x,s) :
+    if s < 0 :  # -s is a target size, compute subsampling ratio
+        s = int(1 + max(x.size(0),x.size(1)) / -s )
+    if x.ndim == 2 :    
+        x = torch.unsqueeze(torch.unsqueeze(x,0),0)
+        x = F.avg_pool2d(x, s)
+        return x.select(0,0).select(0,0)
+    elif x.ndim == 3 :
+        x = torch.unsqueeze(x.movedim(2,0),0)           
+        x = F.avg_pool2d(x, s)
+        return x.select(0,0).movedim(0,2)
+    else :
+        raise Exception("Tensor must have 2 or 3 dimensions")        
+
+# ================================================================
+# background removal by subtracting the median value and dividing
+# by sp = sqrt( AVERAGE square(ReLU(image[i,j]-median)) )
+# in other words, sp is the "positive standard deviation",
+# the deviation of pixels whose value is above the median.
+# pixels whose value is below the median are ignored.
+# this performs a kind of contrast normalization.
+# The resulting values are multiplied by an optional gain.
+# This allows to bring up faint objects like nebula.
+def normalizem(image,gain=1.0) :
+    if image.ndim == 2 :
+        x = image
+        md, sp, sm, mn, mx = histostatmono(x)
+        if sp == 0 :
+            print("normalizem:", md, sp, sm, mn, mx)
+            print("positive standard deviation is zero. Not normalizing")
+            sp = gain
+            # raise Exception("positive standard deviation is zero")
+        return (x-md)*(gain/sp)
+    elif image.ndim == 3 :
+        imagemn = torch.clone(image)
+        for c in range(imagemn.size(2)) :
+            x = image[:,:,c]
+            md, sp, sm, mn, mx = histostatmono(x)
+            if sp == 0 :
+                print("normalizem:", md, sp, sm, mn, mx)
+                print("positive standard deviation is zero. Not normalizing")
+                sp = gain
+            imagemn[:,:,c] = (x-md)*(gain/sp)
+        return imagemn
+    else:
+        raise Exception("Tensor must have 2 or 3 dimensions")         
+         
+
+# def normalizeb(image,gain=1.0) :
+
+    
+# ================================================================
+# contrast correction with a smooth transition between
+# gain g0 at 0 and gain g1 at 1.
+# this gives more control than gamma correction in dark areas.
+# shifted log-sum-exp of two linear functions.
+# maps [0,1] to [0,1] by smoothly transitioning 
+# between a linear gain of appoximately g0 at 0
+# to a linear gain of approximately g1 at 1.
+# Parameter b controls the sharpness of the transition.
+# typical values:
+# g0 in [1.0, 20], typically 3 to 5
+# g1 in [0.1, 1.0], typically 0.2
+# b in [2.0, 20.0]  typically 3 to 5, 2.0: smooth transition, 20.0: sharp transition
+# with low values of b and g1, the derivative at 1 may be
+# significanlty different from g1.
+def correctbigain(x,g0,g1,b) :
+    k0 = g0-1.0
+    k1 = g1-1.0
+    y0 = -np.log((1.0 + np.exp(b*k1)))/b
+    y1 = -np.log((np.exp(-b*k0) + 1.0))/b
+    return -np.log((np.exp(-b*k0*x) + np.exp(-b*(k1*x-k1))))/b - y0 - x*(y1-y0) + x
+
+# ================================================================
+# gamma correction.
+# assumes pixel values are in [0,1]
+def correctgamma(x,g) :
+    return x**(1/g)
+
+# ================================================================
+# linearly map xmin to 0 and xmax to 1 with saturation
+# works with monochrome or color images.
+def saturate(x,xmin,xmax,gain=1.0) :
+    buf = xmax - torch.relu(xmax-x*gain)
+    return torch.relu(buf-xmin)/(xmax-xmin)
+
+# ================================================================
+# extract background image and background information
+# in preparation for star detection before alignment.
+# uses the sep package.
+def background(x, lbw=64, lbh=64, lfw=5, lfh=5) :
+    import sep
+    r = torch.clone(x)
+    m = x[:,:].numpy().copy()
+    bkg = sep.Background(m, bw=lbw, bh=lbh, fw=lfw, fh=lfh)
+    r.copy_( torch.from_numpy( bkg.back() ))
+    bkgim = r
+    return bkgim, bkg
+
+# ================================================================
+# normalizeb: subtract background image
+# and set normalize to positive standard deviation to <gain>.
+# not used here.
+def normalizeb(image,bkgim) :
+    x = image - bkgim
+    md, sp, sm, mn, mx = histostatmono(x)
+    if sp == 0 :
+        print("normalizeb:", md, sp, sm, mn, mx)
+        raise Exception("positive standard deviation is zero")
+    return x*(1.0/sp)
+
+# ================================================================
+# compositing a sequence of monochrome images into a color image.
+# imgseq is a list of images (as 2D PyTorch tensors)
+# coeffs is a list of PyTorch or Numpy vectors with 3 coefficients
+# by which to multiply the monochrome image before accumulation into the 
+# RGB components of the output image.
+def compose(imgseq,coeffs) :
+    composite = torch.zeros(imgseq[0].size(0), imgseq[0].size(1), 3)
+    for i in range(len(imgseq)) :
+        composite[:,:,0] = composite[:,:,0] + imgseq[i]*coeffs[i][0]
+        composite[:,:,1] = composite[:,:,1] + imgseq[i]*coeffs[i][1]
+        composite[:,:,2] = composite[:,:,2] + imgseq[i]*coeffs[i][2]
+    return composite
+
+# ================================================================
+# debayer color image.
+# return HxWx3 RGB image.
+def demosaic(img) :
+    # demosaicing function. Install with:
+    # pip install git+https://github.com/cheind/pytorch-debayer
+    import debayer
+    deb = debayer.Debayer3x3()
+    return deb(img.unsqueeze(0).unsqueeze(0)).squeeze().permute(1,2,0)
+
+# ================================================================
+# decompose a raw color image into its individual color
+# components according to the Bayer mosaic: RGGB.
+# return a HxWx4 tensor with the R, G1, G2, and B components.
+def decompose(x) :
+    rggb = torch.nn.functional.conv2d(x.unsqueeze(0).unsqueeze(0), rggbkernel, stride=2)
+    return rggb.select(0,0)
+
+rggbkernel = torch.tensor([[1,0],[0,0], [0,1],[0,0], [0,0],[1,0], [0,0],[0,1]],dtype=torch.float).view(4,1,2,2)
+
+# ================================================================
+# Detect stars.
+# return a numpy array of x,y coordinates indicating the centers
+# of the brightest stars in the image.
+# Return None if no star can be found.
+# Uses the sep package for adaptive background subtraction
+# and source detection.
+def findstars(x,
+              thres = findstars_thres,
+              min_area = findstars_min_area,
+              max_area = findstars_max_area,
+              max_count = findstars_max_count,
+              verbose=False) :
+    import sep
+
+    bkgim, bkg = background(x)
+    if verbose : print("findstars: background extracted. globalrms=",bkg.globalrms)
+
+    try :
+        sources = sep.extract((x-bkgim).numpy(), thres, err=bkg.globalrms, minarea=min_area)
+        sources.sort(order="flux")   # sort them by brightness
+        sources = sources[::-1]  # reverse order (decreasing brightness)
+        # filter out large objects (could be galaxy centers, nebulae and such)
+        if verbose : print("findstars: detected ",len(sources)," raw stars")
+        filtermask = []
+        for element in sources['npix']:
+            if element < max_area :
+                filtermask.append(True)
+            else:
+                filtermask.append(False)
+        sources = sources[filtermask]
+        if  max_count == 0 :
+            stars = sources
+        else :
+            stars = sources[0:max_count]
+        if verbose : print("findstars: found ",len(stars)," stars")        
+        return np.array([[asrc["x"], asrc["y"]] for asrc in stars])
+    except :
+        if verbose : print("findstars: no stars found")
+        return None
+
+# ================================================================    
+# align the image onto the reference image ref.
+# this assumes that star detection was run on both objects.
+# image: image to align (PyTorch tensor)
+# imagestars: numpy array of image brightest star coordinates.
+# refimage: reference image to which image must be aligned (PyTorch tensor)
+# refstars: numpy array of reference image brightest star coordinates.
+# uses astroalign package from https://astroalign.readthedocs.io/en/latest/
+def align(image,imagestars,refimage,refstars,verbose=False) :
+    import astroalign as aa # https://astroalign.readthedocs.io/en/latest/
+    try :
+        if verbose : print("align: find_transform. reafstars=",len(refstars))        
+        transform, (sourcelist, targetlist) = aa.find_transform(imagestars, refstars)
+        if verbose : print("align. transform: ",transform)
+        aligned = torch.clone(image)
+        xc = image.numpy()
+        reg, mask = aa.apply_transform(transform, xc, refimage)
+        aligned = torch.from_numpy(reg)
+        return aligned, transform, mask
+    except:
+        return None, None, None
+
+# ================================================================
+# top-level image alignment function.
+# Find stars in input image, find the affine transformation between
+# input and reference, and perform the transformation.
+# Return the transformed image.
+# Return None if the alignment failed.
+# Failure occurs when an insufficient number of stars are
+# in both the reference image and the input image.
+# This may happen with noisy images (e.g. from narrow-band filters)
+# or images shot through clouds.
+def register(image, refimage=None, refstars=None, verbose=False,
+             thres=findstars_thres, min_area=findstars_min_area,
+             max_area=findstars_max_area, max_count=findstars_max_count) :
+    if verbose : print("register: calling findstars", flush=True)
+    stars = findstars(image,thres=thres, min_area=min_area,
+                      max_area=max_area, max_count=max_count, verbose=verbose)
+    if stars is None :
+        if verbose : print("register: star detection *** FAILED ***")
+        return None
+    n = len(stars)
+    if verbose : print("register: star detection done, ",n," stars found", flush=True)
+    if not (refimage is None) : 
+        aligned, tr, mask = align(image,stars,refimage,refstars,verbose=verbose)
+        if verbose :
+            if tr is None :
+                print("register: alignment *** FAILED ***")
+            else :
+                print("register: alignment succeeded", flush=True)
+        if tr is None : return None
+    else :
+        aligned = image
+        if verbose : print("register: no alignment", flush=True)
+    if verbose : print("register: done")
+    return aligned
+    
+
+################################################################
+# Main processing function.
+# Swiss army knife.
+# When a parameter is left to its default value
+# or set to None, the corresponding processing step is
+# not performed.
+# parameters:
+# img: input image as a PyTorch tensor
+# refimage: reference image to which input must be aligned
+# refstars: numpy array of star coordinates in reference image
+# roi: region of interest as a list [x, y, width, height]
+# cosm: hot and cold pixels whose value deviates from local mean by more than <cosm>
+#   times the local standard deviation will be removed. A good value is around 3.0
+# binn: subsampling/binning.
+#     If a positive integer: subsample image by that ratio using averaging.
+#     If a negative number: resize image by an integer ratio so that that its maximum size <binn>
+# norm: subtract median value, and divide pixels by postiive standard deviation.
+# gain: multiply all pixel values by <gain>
+# offset: add offset to all pixel values.
+# align: boolean. if True, align input image on to reference image.
+# satur: saturate (clip) values to interval [0,1]
+# gamma: gamma correction. Pixels are saturated before this.
+# verbose: verbosity level.
+def process(img,refimage=None,refstars=None,roi=None,
+            cosm=False,binn=None,norm=False,gain=None,offset=None,
+            align=False,satur=False,gamma=None,verbose=False) :
+    # region of interest / cropping
+    if roi is None :
+        c = img
+    else :
+        c = crop(img,roi[0],roi[1],roi[2],roi[3])
+
+    # cosmetic correction / hot pixel removal.
+    if cosm :
+        c = cosmetic(c, cosm)
+        if verbose : print("hot pixel removed: ",len(c[1][0][0]))
+        c = c[0]
+
+    # subsampling / binning
+    if binn :
+        c = binning(c,binn)
+        
+    # normalization: subtract median and divide by positive standard dev above median.
+    if norm :
+        if verbose : print("normalizing by median subtraction")
+        c = normalizem(c,gain=1.0)
+
+    # gain
+    if gain :
+        if verbose : print("amplifying. gain=",gain)
+        c = c*gain
+
+    # offset
+    if offset :
+        if verbose : print("offseting. offset=",offset)        
+        c = c+offset
+
+    # alignment
+    if align :
+        if verbose : print("aligning")
+        c = register(c, refimage, refstars, verbose=verbose)
+        
+    if not (c is None) :
+        # saturation
+        if satur :
+            if verbose : print("saturating")
+            c = saturate(c, 0.0, 1.0)
+
+            # gamma correction
+            if gamma :
+                if verbose : print("gamma correcting. gamma=",gamma)         
+                if satur != True :  c = saturate(c, 0.0, 1.0)
+                c = correctgamma(c,gamma)
+        
+    return c
+
+
+################################################################
+# processing fonction for color images
+# used only for diplay for now.
+def process_color(img,roi=None,binn=None,norm=False,
+                  gain=None,offset=None,satur=False,gamma=None,
+                  verbose=False) :
+
+    # debayer
+    c = demosaic(img)
+    
+    # region of interest / cropping
+    if not (roi is None) :
+        c = crop(img,roi[0],roi[1],roi[2],roi[3])
+
+    # subsampling / binning
+    if binn :
+        c = binning(c,binn)
+        
+    # normalization: subtract median and divide by positive standard dev above median.
+    if norm :
+        if verbose : print("normalizing by median subtraction")
+        c = normalizem(c,gain=1.0)
+
+    # gain
+    if gain :
+        if verbose : print("amplifying. gain=",gain)
+        c = c*gain
+
+    # offset
+    if offset :
+        if verbose : print("offseting. offset=",offset)        
+        c = c+offset
+
+    if not (c is None) :
+        # saturation
+        if satur :
+            if verbose : print("saturating")
+            c = saturate(c, 0.0, 1.0)
+
+            # gamma correction
+            if gamma :
+                if verbose : print("gamma correcting. gamma=",gamma)         
+                if satur != True :  c = saturate(c, 0.0, 1.0)
+                c = correctgamma(c,gamma)
+        
+    return c
+
+################################################################
+# Napari display functions.
+
+# Display a single image.
+# Image can be monochrome or color.
+def dispimage(image, viewer, nm="image", gain=1.0, offset=0.0, satur=False) :
+    if satur == True :
+        x = saturate(image*gain + offset, 0.0, 1.0)
+    else :
+        x = image*gain + offset
+    n = x.ndim
+    if n == 2 :
+        return viewer.add_image(x.numpy(), rgb=False, name=nm)
+    elif n ==3 :
+        return viewer.add_image(x.numpy(), rgb=True, name=nm)
+    else :
+        raise Exception("Tensor must have 2 or 3 dimensions")
+
+# display a stack of images in a Napari viewer.
+# st: a list (or sequence) of images as PyTorch tensors
+# Images can be monochrome or color.
+def dispseq(seq, viewer, nm="sequence", gain=1.0, offset=0.0, satur=False) :
+    th = len(seq)
+    s = seq[0].size()
+    n = len(s)
+    if n == 2 :
+        x = np.empty([th,s[0],s[1]])
+        i = 0
+        for image in seq :
+            if satur == True :
+                np.copyto(x[i,:,:],(saturate(image*gain+offset,0.0,1.0)).numpy())
+            else:
+                np.copyto(x[i,:,:],(image*gain+offset).numpy())
+            i += 1
+        return viewer.add_image(x, rgb=False, name=nm)            
+    elif n == 3 :
+        x = np.empty([th,s[0],s[1],s[2]])
+        i = 0
+        for image in seq :
+            if satur == True :
+                np.copyto(x[i,:,:,:],(saturate(image*gain+offset,0.0,1.0)).numpy())
+            else:
+                np.copyto(x[i,:,:,:],(image*gain+offset).numpy())
+            i += 1
+        # print("dispseq:",x.size(),flush=True)
+        return viewer.add_image(x, rgb=True, name=nm)
+    else :
+        raise Exception("Tensor must have 2 or 3 dimensions")        
+
+# Updates an already displayed image.
+# not used yet.
+def update_layer(viewer,layer,data):
+        layer.data = data
+        layer.refresh()
+        viewer.reset_view()
+
+################################################################
+# Various file I/O functions for image file lists and such.
+
+# ================================================================
+# get a list of image files, either from command line or by reading
+# file names from a listfile.
+def get_flist(listfile,infiles) :
+    if listfile == None :
+        flist = infiles  # if not, file names are on the command line
+    else :   # else read image file names from flist arg.
+        lf = open(listfile,'r')
+        fl =  lf.readlines()
+        flist = []
+        for f in fl :  
+            if f.strip()[0] != '#' :    # eliminate lines starting with #.
+                flist.append( f.split()[-1] )  # get the last item on the line
+    return flist
+
+# ================================================================
+# read a bunch of FITS image files and return a list of
+# the images in the form of PyTorch tensors.
+# This works for monochrome and color images.
+# Also returns a list of names of the files that were actually read.
+def read_rawseq(flist,verbose=False) :
+    rawseq=[]
+    fnames=[]
+    for f in flist :
+        if verbose : print("*** reading:",f)
+        if f[0] == "@" :
+            image = torch.flip(readfits(f[1:]), [0,1])  # file name starts with '@' rotate by 180 degrees
+        else:
+            image = readfits(f)
+        if not (image is None) :
+            rawseq.append(image)
+            fnames.append(f)
+        else :
+            if verbose : print("skipping ",f)
+    return rawseq, fnames
+
+# ================================================================
+# Write file names contained in flist into text file <edit>,
+# Then fire up a text editor on <edit> so user
+# can select which images are good, bad, or flipped.
+# The text editor is looked for in the shell environment variable $EDITOR.
+# If the variable is not set, a defautl editor is started,
+# which is gedit on Linux
+def edit_list(edit,flist) :
+        f = open(edit,'w')    
+        for i in range(len(flist)) :
+            if edit : f.write(str(i)+" "+flist[i]+"\n")
+        f.close()
+        # call text editor as background task
+        editor = os.getenv('EDITOR')
+        if type(editor) != str : editor = default_editor
+        os.system(editor+' '+edit+' &')
+        return None
+
+            
+################################################################
+# main top-level calls.
+# If you import this file into a Python program,
+# these are the top-level functions you should call.
+
+
+# ================================================================
+# decompose images in sequencee into R G1, G2 and B component images.
+# save resulting images into directory <output>.
+def yastro_decompose(flist,output,verbose=False) :
+    # read images
+    rawseq, flist = read_rawseq(flist,verbose=verbose)
+    # save processed images
+    for i in range(len(flist)) :
+        rggb = decompose(rawseq[i])
+        print("raw  size:",rawseq[i].size())
+        print("rggb size:",rggb.size())        
+        writefits(rggb.select(0,0),output+"/"+os.path.basename(flist[i])+"-yastro-R.fit")
+        writefits(rggb.select(0,1),output+"/"+os.path.basename(flist[i])+"-yastro-G1.fit")
+        writefits(rggb.select(0,2),output+"/"+os.path.basename(flist[i])+"-yastro-G2.fit")
+        writefits(rggb.select(0,3),output+"/"+os.path.basename(flist[i])+"-yastro-B.fit")
+        rawseq[i]=None
+    return None
+
+
+# ==============================================================
+# make an RGB composite image from monochrome images
+# imgseq: list of monochrome images (as 2D PyTorch tensors)
+# coeffs: list of triplets of R,G,B coefficients. The corresponding
+#   image in imgseq will be multiplied by each of those coefficients
+#   and accumulated into the composite image.
+# output: a file name to save the resulting composite image.
+# display: if True, the resulting image will be displayed in Napari.
+def yastro_compose(imgseq,coeffs,gain=None,satur=False,output=None,display=False,verbose=False) :
+
+    c = compose(imgseq,coeffs)
+
+    if gain :
+        if verbose : print("compose: amplifying. gain=",gain)
+        c = c*gain
+
+    if satur :
+        if verbose : print("compose: saturating")        
+        c = saturate(c, 0.0, 1.0)
+        
+    if output :
+        if verbose : print("compose: saving composite to: ",output)
+        writefits(c, output)
+
+    if display :
+        import napari
+        viewer = napari.Viewer()
+        seqlayer = dispimage(c,viewer,nm="composite",satur=False)
+        napari.run()
+        # viewer.close()
+        
+    return None
+
+    
+# ================================================================
+# Display images in color after debayering.
+def yastro_displaycolor(flist,roi=None,binn=None,norm=None,
+                        gain=None,offset=None,satur=None,gamma=None,
+                        listfiles=None,edit=None,verbose=None) :
+    # read all files
+    rawseq, flist = read_rawseq(flist,verbose=verbose)
+    num_files = len(flist)
+    if verbose : print("=== number of images in sequence: ",num_files)
+
+    imgseq = []  # will be the list of processed images
+    for image,f in zip(rawseq, flist) :
+        c = process_color(image,roi=roi,binn=binn,norm=norm,
+                          gain=gain,offset=offset,satur=satur,gamma=gamma,
+                          verbose=verbose)
+        imgseq.append(c)
+        
+    # write numbered list of image file names on stdout
+    if listfiles:
+        for i in range(len(flist)) :
+            if listfiles : print(i, " ", flist[i])
+        
+    # write numbered list of image file names in text file
+    if edit :
+        edit_list(edit,flist)
+
+    # display image sequence in Napari.
+    if True :
+        import napari
+        viewer = napari.Viewer()
+        seqlayer = dispseq(imgseq,viewer,satur=False)
+        napari.run()
+
+    return None
+
+# ================================================================
+# main processing / display function.
+# Swiss army knife: does everything except compositing
+def yastro(flist,roi=None,
+           cosm=False,binn=None,norm=False,gain=None,offset=None,
+           align=None,satur=False,gamma=None,
+           verbose=False,
+           output=None,stacked=None,listfiles=None,edit=None,
+           display=None,Display=None) :
+
+    # if alignement is desired, read reference image and find stars in it
+    refimage = None
+    refstars = None
+    if align :
+        if verbose : print("*** reference image processing")
+        refimage = process(readfits(align),cosm=3.0,binn=binn,roi=roi,verbose=verbose)
+        refstars = findstars(refimage,verbose=verbose)
+        if refstars is None :
+            raise Exception("no star could be found in reference image")
+
+    # read image sequence
+    rawseq, flist = read_rawseq(flist,verbose=verbose)
+    num_files = len(flist)
+    if verbose : print("=== number of images in sequence: ",num_files)
+
+    # process image sequence.
+    imgseq = []  # will be the list of successfully processed images
+    fnames = []  # will be the list of successfully processed image files
+    for image,f in zip(rawseq, flist) :
+        c = process(image, refimage=refimage,refstars=refstars,roi=roi,
+                    cosm=cosm,binn=binn,norm=norm,gain=gain,offset=offset,
+                    align=align,satur=satur,gamma=gamma,verbose=verbose)
+        # if processing succeeded, add resulting image to the sequence
+        if not (c is None) :
+            imgseq.append(c)
+            fnames.append(f)
+        else :
+            if verbose : print("processing failed for file ",f)
+
+    # delete sequence of raw images to save memory.
+    rawseq = None  
+    
+    # write numbered list of image file names on stdout
+    if listfiles:
+        for i in range(len(fnames)) :
+            if listfiles : print(i, " ", fnames[i])
+        
+    # write numbered list of image file names in text file
+    if edit :
+        edit_list(edit,fnames)
+        
+    # save processed images
+    for i in range(len(imgseq)) :
+        if output :
+            writefits(imgseq[i],output+"/"+os.path.basename(flist[i])+"-yastro.fit")
+        # print(i,":",histostatmono(imgseq[i]))
+
+    # stack images by averaging,
+    if stacked :
+        final = torch.clone(imgseq[0])
+        for im in imgseq[1:] :
+            final = final + im
+        final = final * (1/len(imgseq))
+        writefits(final, stacked)
+
+    # display image sequence in Napari.
+    if display or Display :
+        import napari
+        viewer = napari.Viewer()
+        sat = False
+        if Display : sat = True
+        seqlayer = dispseq(imgseq,viewer,satur=sat)
+        if not (refimage is None) :
+            reflayer = dispimage(refimage, viewer, satur=None, nm="reference")
+        if stacked :
+            stacklayer = dispimage(final, viewer, satur=sat, nm="stacked")
+        napari.run()
+
+    return None
+
+
+
+################################################################
+################################################################
+# Code below this line pertains to argument processing
+# when this file is called as a script on the command line.
+
+
+################################################################
+# argument parsing functions
+
+def parse_verbose(parser):
+    parser.add_argument("-v",
+                        "--verbose",
+                        action="store_true",                        
+                        help="increase output verbosity")
+
+def parse_infiles(parser):
+    parser.add_argument("infiles", nargs="*",
+                        metavar = "infile",                        
+  		        help = "file1.fit file2.fit...")
+
+def parse_flist(parser):
+    parser.add_argument("-f", "--flist",
+                        metavar = "flist.txt",                        
+  		        help = textwrap.dedent('''
+                        file containing a list of image file names, one per line. Entries
+                        beginning with '#' are ignored. File names preceded with '@' will
+                        cause the image to by rotated by 180 degrees (e.g. for images shot
+                        after a meridian flip)'''))
+
+def parse_incomp(parser):
+    parser.add_argument("incomp", nargs="*",
+                        metavar = "file1.fit r1,g1,b1 file2.fit r2,g2,b2 ...",                        
+  		        help = textwrap.dedent(''' 
+                        a list of monochrome fits files with comma-separated list of
+                        coefficients for R,G and B components'''))
+
+def parse_list(parser):
+    parser.add_argument("-l", "--list",
+                        action="store_true",                        
+                        help = textwrap.dedent(''' 
+                        list the file names of the images being processed/displayed in a
+                        file or on stdout. This file can be edited to constitute a list of
+                        valid images and subsequently passed to the -f option.'''))
+
+
+def parse_edit(parser):
+    parser.add_argument("-e", "--edit",
+                        metavar = "flist.txt",
+  		        help = textwrap.dedent('''
+                        write list of image files into flist.txt and open an editor. The
+                        editor is the content of the $EDITOR shell variable or gedit by
+                        default. This makes it easy to select valid images to be used with
+                        option -f. Adding # at the beginning of a line will cause the
+                        corresponding file to be ignored. Adding '@' just before an image file
+                        name will cause the image to by rotated by 180 degrees (e.g. for
+                        images shot after a meridian flip) '''))
+
+def parse_bin(parser,defo=None):
+    parser.add_argument("-b", "--bin",
+		        type=int,
+                        default = defo,
+                        metavar = "param",                        
+  		        help = textwrap.dedent(''' 
+                        Binning/subsampling. If param is positive,
+                        subsample image by param (int). If negative, subsample by an integer
+                        ratio so that the largest image dimension is smaller than -param'''))
+
+def parse_norm(parser,defo=None):
+    parser.add_argument("-n", "--norm",
+                        default = defo,
+                        action="store_true",
+  		        help = textwrap.dedent(''' 
+                        Normalize image by subtracting median and dividing by psdev where
+                        psdev is standard deviation of pixels above median'''))
+
+def parse_gain(parser,defo=None):
+    parser.add_argument("-g", "--gain",
+		        type=float,
+                        default = defo,
+                        metavar = "coeff",
+  		        help = textwrap.dedent(''' 
+                        Multiply pixel values by coeff (a float)'''))
+
+def parse_offset(parser,defo=None):
+    parser.add_argument("-O", "--offset",
+		        type=float,
+                        default = defo,
+                        metavar = "value",                        
+  		        help = "add <value> to all pixels.")
+
+def parse_satur(parser,defo=None):
+    parser.add_argument("-s", "--satur",
+                        default = defo,
+                        action="store_true",                        
+  		        help = "Saturate pixel values to range [0,1]")
+
+def parse_gamma(parser,defo=None):
+    parser.add_argument("-G", "--gamma",
+		        type=float,
+		        default = defo,
+                        metavar = "value",                        
+  		        help = textwrap.dedent(''' 
+                        gamma correction. value is gamma coefficient 
+                        (good values: 1 to 3). 
+                        Causes saturation to [0,1]'''))
+
+def parse_roi(parser):
+    parser.add_argument("-r", "--roi",
+                        type=lambda x : x.split(','),
+                        default = None,
+                        metavar = "x,y,w,h",                        
+  		        help = "Cropping. Param is comma-separated list x,y,w,h",)
+
+def parse_output(parser):
+    parser.add_argument("-o", "--output",
+                        metavar = "output_dir",                        
+  		        help = "output directory for processed images")
+
+def parse_stacked(parser):
+    parser.add_argument("-t", "--stacked",
+                        metavar = "stacked.fit",                        
+  		        help = "output file for stacked image")
+
+def parse_align(parser):
+    parser.add_argument("-a", "--align",
+                        metavar = "refimage.fit",                        
+  		        help = "align all images to a reference image refimage.fit")
+
+def parse_cosm(parser):
+    parser.add_argument("-c", "--cosm",
+		        type=float,
+		        default=None,
+                        metavar = "value",
+  		        help = textwrap.dedent(''' 
+                        Cosmetic cleanup: pixels outside local mean plus/minus local
+                        stdev*value are filtered out (good value: 3)'''))
+
+def parse_display(parser,defo=None):
+    parser.add_argument("-d", "--display",
+                        default = defo,
+                        action="store_true",                        
+                        help= textwrap.dedent(''' 
+                        display processed images in Napari. Napari maps min value to
+                        black and max value to white'''))
+
+def parse_Display(parser,defo=None):
+    parser.add_argument("-D", "--Display",
+                        default = defo,
+                        action="store_true",                        
+                        help="display processed images. Displayed pixel values are saturated to [0,1]")
+
+def parse_stars(parser):
+    parser.add_argument("-S", "--stars",
+                        action="store_true",                        
+                        help="display detected stars in Napari [not implemented yet]",)
+
+################################################################
+# main calls for all the commands
+
+# ==============================================================
+# make a bunch of monochrome image sequences by splitting
+# raw color images
+def main_yastro_decompose(prog) :
+    parser = argparse.ArgumentParser( 
+        description = "Make a sequence of monochrome images from a sequence of raw color images."
+    )
+    
+    parse_infiles(parser)
+    parse_flist(parser)
+    parse_output(parser)
+    parse_verbose(parser)
+    args = vars(parser.parse_args())
+    flist = get_flist(args['flist'],args['infiles'])
+    output = args['output']
+    verbose = args['verbose']
+    
+    if verbose :
+        # print("yastro_decompose: flist:",flist)
+        print("yastro_decompose: output:",output)        
+
+    yastro_decompose(flist,output,verbose=verbose)
+
+
+# ==============================================================
+# make a composite image from monochrome images.
+def main_yastro_compose(prog) :
+    parser = argparse.ArgumentParser( 
+        description = "Make a color composite image from individual monochrome images."
+    )
+    
+    parse_incomp(parser)
+    parse_output(parser)
+    parse_gain(parser)
+    parse_satur(parser)
+    parse_verbose(parser)
+    parse_display(parser)    
+    args = vars(parser.parse_args())
+    flist = args['incomp']
+    output = args['output']
+    gain = args['gain']
+    satur = args['satur']
+    verbose = args['verbose']
+    display = args['display']    
+    
+    z = 0
+    fnames = []
+    imgseq = []
+    coeffs = []
+    for f in flist :
+        if z == 0 :
+            fnames.append(f)
+            imgseq.append(readfits(f))
+            z = 1-z
+        else :
+            rgb = list(map(float,f.split(',')))
+            coeffs.append([rgb[0],rgb[1],rgb[2]])
+            z = 1-z
+
+    if verbose :
+        print("yastro_compose: fnames:",fnames)
+        print("yastro_compose: coeffs:",coeffs)
+
+    yastro_compose(imgseq,coeffs,gain=gain,satur=satur,output=output,display=display,verbose=verbose)
+
+# ================================================================
+# display color images after debayering
+def main_yastro_displaycolor(prog) :
+    parser = argparse.ArgumentParser( 
+        description = "Display a sequence of color images in Napari."
+    )
+
+    parse_infiles(parser)
+    parse_flist(parser)
+    parse_roi(parser)
+    parse_bin(parser)
+    parse_norm(parser)    
+    parse_gain(parser)
+    parse_offset(parser)
+    parse_satur(parser)
+    parse_gamma(parser)
+    parse_list(parser)
+    parse_edit(parser)
+    parse_verbose(parser)
+
+    args = vars(parser.parse_args())
+    flist = get_flist(args['flist'],args['infiles'])
+    verbose = args['verbose']
+    roi = args['roi']
+    binn = args['bin']
+    norm = args['norm']
+    gain = args['gain']
+    offset = args['offset']
+    satur = args['satur']
+    gamma = args['gamma']
+    listfiles = args['list']
+    edit = args['edit']     
+    if roi != None :  roi = list(map(int,roi))
+    if verbose : print("roi=",roi)
+    
+
+    yastro_displaycolor(flist,roi=roi,binn=binn,norm=norm,
+                        gain=gain,offset=offset,satur=satur,gamma=gamma,
+                        listfiles=listfiles,edit=edit,verbose=verbose) 
+    return None
+
+# ==============================================================
+# Display images.
+def main_yastro_display(prog) :
+    parser = argparse.ArgumentParser( 
+        description = "Display a sequence of images in Napari. Images can be background-subtracted, contrast normalized, and saturated."
+    )
+
+    parse_infiles(parser)
+    parse_flist(parser)
+    parse_roi(parser)
+    parse_cosm(parser)    
+    parse_bin(parser)
+    parse_norm(parser)    
+    parse_gain(parser)
+    parse_offset(parser)
+    parse_satur(parser)
+    parse_gamma(parser)
+    parse_list(parser)
+    parse_edit(parser)
+    parse_verbose(parser)
+
+    args = vars(parser.parse_args())
+    flist = get_flist(args['flist'],args['infiles'])
+    verbose = args['verbose']
+    roi = args['roi']
+    cosm = args['cosm']
+    binn = args['bin']   
+    norm = args['norm']
+    gain = args['gain']
+    offset = args['offset']
+    satur = args['satur']
+    gamma = args['gamma']
+    listfiles = args['list']
+    edit = args['edit']     
+    if roi != None :  roi = list(map(int,roi))
+    if verbose : print("roi=",roi)
+    
+    yastro(flist,roi=roi,
+           cosm=cosm,binn=binn,norm=norm,gain=gain,offset=offset,
+           align=None,satur=satur,gamma=gamma,
+           verbose=verbose,
+           output=None,stacked=None,listfiles=None,edit=None,
+           display=True,Display=None)
+
+
+# ==============================================================
+# Display images and list them in an editable file
+# so they can be marked as good, bad, or flipped for further processing.
+# The resulting file can be passed to further processing using the --flist option.
+def main_yastro_select(prog) :
+    parser = argparse.ArgumentParser( 
+        description = textwrap.dedent(''' 
+        Display a sequence of images in Napari, list them in a text file,
+        and call a text editor on the text file so that images can be inspected
+        and marked as good, bad, or flipped. Images are background-subtracted,
+        contrast-normalized, and subsampled to fit in a 2000x2000 pixel
+        square by default. Displaying a long sequence of very hi-res
+        images may take a very long time and lots of memory. 
+        So cropping, subsampling or resizing is advised.''' ))
+
+    parse_infiles(parser)
+    parse_flist(parser)
+    
+    parse_bin(parser)
+    parse_gain(parser)
+    parse_offset(parser)
+    parse_satur(parser)
+    parse_gamma(parser)
+    parse_roi(parser)
+    parse_edit(parser)
+    parse_verbose(parser)
+
+    args = vars(parser.parse_args())
+    flist = get_flist(args['flist'],args['infiles'])
+
+    binn = args['bin']
+    gain = args['gain']
+    offset = args['offset']
+    satur = args['satur']
+    gamma = args['gamma']
+    roi = args['roi']
+    edit = args['edit']
+    verbose = args['verbose']
+    
+    if type(edit) != str :
+        raise Exception("no file name for file list was given. Use '-e' or '--edit' option")
+    if roi != None :  roi = list(map(int,roi))
+    if not binn : binn = -2000
+    if verbose : print("roi=",roi)
+    
+    yastro(flist,roi=roi,
+           cosm=None,binn=binn,norm=True,gain=gain,offset=offset,
+           align=None,satur=satur,gamma=gamma,
+           verbose=verbose,
+           output=None,stacked=None,listfiles=None,edit=edit,
+           display=True,Display=False)
+
+
+
+# ==============================================================
+# top-level function for all processing and display.
+
+def main_yastro(prog) :
+    parser = argparse.ArgumentParser( 
+        description = textwrap.dedent(''' 
+        Process and display FITS images. The numerous options
+        allow to activate or deactivate parts of the processing chain.
+        The processing chain consists of:
+        cropping, cosmetic cleanup, binning/resizing, median subtraction and
+        contrast normalization, multiplicative gain, additive offset, 
+        alignment to a reference image, saturation, and gamma correction.
+        The processed images can be displayed interactively using Napari.
+        A file containing the image file name can be written for subsequent
+        selection of good images.
+        Image file names can be given on the command line or read from a
+        file through the -f option.
+        '''),
+        epilog = '''
+        Examples:\n
+        yastro -v -r 3400,2000,2400,2400 -c 3.0 -n -g 0.2 -a refimage-L.fit 
+        -G 2.0 -t stack-L.fit -D -f *_L_*.fit\n
+        yastro -v -r 3400,2000,2400,2400 -c 3.0 -n -g 0.2 -a refimage-L.fit 
+        -G 2.0 -t stack-L.fit -D -f valids-L.txt 
+        ''')
+        
+
+    parse_infiles(parser)
+    parse_flist(parser)
+    
+    parse_roi(parser)
+    parse_cosm(parser)
+    parse_bin(parser)
+    parse_norm(parser)
+    parse_gain(parser)
+    parse_offset(parser)
+
+    parse_align(parser)
+    parse_satur(parser)
+    parse_gamma(parser)
+
+    parse_verbose(parser)
+
+    parse_output(parser)
+    parse_stacked(parser)
+    
+    parse_list(parser)
+    parse_edit(parser)
+
+    parse_display(parser)
+    parse_Display(parser)        
+    
+    args = vars(parser.parse_args())
+    flist = get_flist(args['flist'],args['infiles'])
+
+    roi = args['roi']
+    cosm = args['cosm']
+    binn = args['bin']
+    norm = args['norm']    
+    gain = args['gain']
+    offset = args['offset']
+
+    align = args['align']    
+    satur = args['satur']
+    gamma = args['gamma']
+
+    verbose = args['verbose']
+
+    output = args['output']
+    stacked = args['stacked']
+
+    listfiles = args['list']
+    edit = args['edit']        
+
+    display = args['display']
+    Display = args['Display']
+
+    if roi != None :  roi = list(map(int,roi))
+    if verbose :  print("roi=",roi)
+
+    yastro(flist,roi=roi,
+           cosm=cosm,binn=binn,norm=norm,gain=gain,offset=offset,
+           align=align,satur=satur,gamma=gamma,
+           verbose=verbose,
+           output=output,stacked=stacked,listfiles=listfiles,edit=edit,
+           display=display,Display=Display)
+    return None
+
+
+################################################################
+# Main code, only run when this is called from the command line.
+# Not executed if the present file is imported.
+
+if __name__ == '__main__':
+
+  prog = os.path.basename(__file__)
+
+  # make a bunch of monochrom images from a bunch of raw color images
+  if prog == "yastro-decompose" :  main_yastro_decompose(prog)
+
+  # make a composite color image from monochrome images.
+  elif prog == "yastro-compose" :  main_yastro_compose(prog)
+
+  # display color images
+  elif prog == "yastro-displaycolor" :  main_yastro_displaycolor(prog)
+
+  # display command a bunch of images in Napar.
+  elif prog == "yastro-display" :  main_yastro_display(prog)
+
+  # display a bunch of images, list their names in a file,
+  # and call a text editor so that good bad, and flipped
+  # images can be marked for further processing.
+  # the resulting file can be passed to subsequent processing
+  # with the --flist option.
+  elif prog == "yastro-select" :  main_yastro_select(prog)
+
+  # general processing command.
+  # Can do pretty much everything with appropriate options
+  # except compositing.
+  elif prog == "yastro" :  main_yastro(prog)
+
+  else:
+      raise Exception("internal error: unkown command-line name.")
